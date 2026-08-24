@@ -1,0 +1,150 @@
+# imPAC tfgate — the GitHub Action.
+#
+# The whole client lives in scripts/gate.sh. Inputs reach it through the environment, never
+# through interpolation into a command line: a token in argv lands in process listings, and
+# `${{ }}` substitution inside a shell command turns a path containing a quote into a syntax
+# error.
+#
+# THE EXIT CONTRACT IS FROZEN AND IS PUBLIC API:
+#
+#   0  PASS       the gate ran to completion on the imPAC deployment and nothing blocked
+#   1  BLOCKED    the gate ran to completion and the plan violates policy
+#   2  TOOL ERROR no verdict was rendered — the plan has NOT been judged
+#
+# Conflating 1 and 2 is how a scanner becomes a rubber stamp: treat every non-zero as "policy
+# failure" and a corrupt plan reads as a blocked deploy (noisy but safe); treat every non-zero as
+# "tool flake" and retry-then-continue waves an unevaluated plan through (silent and fatal).
+
+name: 'imPAC tfgate — Terraform plan gate'
+description: >-
+  Evaluate a terraform plan against the live policies on your imPAC deployment — including your
+  custom rules — and gate the pipeline on the verdict.
+author: 'imPAC Labs'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-url:
+    description: >-
+      Base URL of your imPAC deployment, e.g. https://api.yourstack.impac.io. The action appends
+      the /it/v3/gate/* paths itself.
+    required: true
+  pipeline-key:
+    description: >-
+      imPAC pipeline key, scoped CI_SCANNER. Pass a secret, never a literal — this key can submit
+      plans for evaluation on your deployment.
+    required: true
+  plan-json:
+    description: 'Path to `terraform show -json` output.'
+    required: true
+  source-dir:
+    description: >-
+      Root of the terraform source to scan for file:line locations. Findings carry a resource
+      address but no source location — the server evaluates plan JSON and never sees your .tf
+      files — so the action resolves `resource "TYPE" "NAME"` against the checkout here. Point this
+      at the directory containing the .tf files that produced the plan. Defaults to the workspace.
+    required: false
+    default: '.'
+  block-on:
+    description: 'Block on findings at or above this severity: critical|high|medium|low.'
+    required: false
+    default: 'high'
+  frameworks:
+    description: >-
+      Comma-separated framework ids to scope the REPORT to. Scoping the report never weakens the
+      gate: a blocking finding outside the scoped frameworks still blocks.
+    required: false
+    default: ''
+  framework-block-on:
+    description: 'Severity floor applied to framework-mapped findings: critical|high|medium|low.'
+    required: false
+    default: ''
+  timeout-minutes:
+    description: >-
+      How long to wait for the server verdict before giving up. A timeout is exit 2, never a pass.
+    required: false
+    default: '10'
+  poll-interval-seconds:
+    description: 'Seconds between status polls while the evaluation runs.'
+    required: false
+    default: '10'
+  ci-provider:
+    description: >-
+      Which CI system this is running on: auto|github|gitlab. `auto` detects it from the runner's
+      own marker variable and is almost always right; set it explicitly only for a runner that
+      sets neither. GitLab users normally consume gitlab/tfgate.gitlab-ci.yml rather than this
+      action, which GitLab cannot run.
+    required: false
+    default: 'auto'
+  report-path:
+    description: 'Where to write the JSON report returned by the server.'
+    required: false
+    default: 'report.json'
+  sarif-path:
+    description: 'Where to write the SARIF report returned by the server.'
+    required: false
+    default: 'report.sarif'
+  upload-sarif:
+    description: >-
+      Upload the SARIF to GitHub code scanning. Requires `security-events: write` and, on private
+      repositories, GitHub Advanced Security.
+    required: false
+    default: 'false'
+  sarif-category:
+    description: >-
+      Code-scanning category for the upload. One category per logical scan: two uploads sharing a
+      category SUPERSEDE each other, so a repo that gates several plans (per environment, per
+      stack) must give each one its own category or only the last one's findings survive.
+    required: false
+    default: 'impac-tfgate'
+
+outputs:
+  verdict:
+    description: 'PASS or BLOCKED. Empty when no verdict was rendered (exit 2).'
+    value: ${{ steps.gate.outputs.verdict }}
+  exit-code:
+    description: 'The gate exit code: 0 pass, 1 blocked, 2 tool error.'
+    value: ${{ steps.gate.outputs.exit-code }}
+  report-path:
+    description: 'Path to the JSON report written into the workspace.'
+    value: ${{ steps.gate.outputs.report-path }}
+  sarif-path:
+    description: 'Path to the SARIF report written into the workspace.'
+    value: ${{ steps.gate.outputs.sarif-path }}
+
+runs:
+  # COMPOSITE, not Docker and not JS. No container pull on every run, works across all three
+  # runner OSes, and no Node runtime version to pin and re-pin as GitHub deprecates them.
+  using: 'composite'
+  steps:
+    - name: Evaluate the plan on imPAC
+      id: gate
+      shell: bash
+      env:
+        INPUT_CI_PROVIDER: ${{ inputs.ci-provider }}
+        INPUT_API_URL: ${{ inputs.api-url }}
+        INPUT_PIPELINE_KEY: ${{ inputs.pipeline-key }}
+        INPUT_PLAN_JSON: ${{ inputs.plan-json }}
+        INPUT_SOURCE_DIR: ${{ inputs.source-dir }}
+        INPUT_BLOCK_ON: ${{ inputs.block-on }}
+        INPUT_FRAMEWORKS: ${{ inputs.frameworks }}
+        INPUT_FRAMEWORK_BLOCK_ON: ${{ inputs.framework-block-on }}
+        INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        INPUT_POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
+        INPUT_REPORT_PATH: ${{ inputs.report-path }}
+        INPUT_SARIF_PATH: ${{ inputs.sarif-path }}
+        GATE_SCRIPT_DIR: ${{ github.action_path }}/scripts
+      run: bash "${GATE_SCRIPT_DIR}/gate.sh"
+
+    - name: Upload SARIF to code scanning
+      # `always()` is load-bearing. The SARIF must upload when the gate BLOCKS — that is precisely
+      # when a reviewer needs the findings. A success-only upload would surface results exclusively
+      # on runs that had none.
+      #
+      if: always() && inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.sarif-path }}
+        category: ${{ inputs.sarif-category }}

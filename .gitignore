@@ -1,0 +1,15 @@
+# Terraform working files.
+.terraform/
+.terraform.lock.hcl
+*.tfplan
+tfplan.bin
+plan.json
+
+# Gate reports produced by local runs.
+report.json
+report.sarif
+tfgate*.json
+tfgate*.sarif
+
+__pycache__/
+*.pyc

@@ -1,0 +1,139 @@
+# imPAC tfgate — the GitLab CI template.
+#
+# The GitLab counterpart to action.yml. Same client (scripts/gate.sh), same server, same frozen
+# exit contract; only the wrapper differs, because GitLab cannot run a GitHub Action.
+#
+# Include it and provide the two variables the gate needs:
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/imPAClabs/tfgate-action/v1/gitlab/tfgate.gitlab-ci.yml'
+#
+#   variables:
+#     IMPAC_API_URL: 'https://api.yourstack.impac.io'
+#     # IMPAC_PIPELINE_KEY: set as a MASKED, PROTECTED CI/CD variable in the project settings.
+#     #                     Never in this file — it can submit plans against your deployment.
+#
+#   terraform-gate:
+#     extends: .impac_tfgate
+#     needs: ['terraform-plan']      # a job that produced the plan JSON below
+#
+# NOTE ON THE TERRAFORM IMAGE. If the job that produces the plan uses a `hashicorp/terraform`
+# image, override its entrypoint — that image's ENTRYPOINT is `terraform` itself, so GitLab's
+# shell-based `script:` lines are passed to terraform as arguments and the job fails before it
+# runs anything:
+#
+#   terraform-plan:
+#     image:
+#       name: hashicorp/terraform:1.9
+#       entrypoint: [""]
+#     script:
+#       - terraform init && terraform plan -out=tfplan
+#       - terraform show -json tfplan > plan.json
+#     artifacts:
+#       paths: ['plan.json']
+#
+# THE EXIT CONTRACT IS PUBLIC API AND IT IS FAIL-CLOSED:
+#
+#   0  PASS       the gate ran on your imPAC deployment and nothing blocked
+#   1  BLOCKED    the gate ran and the plan violates policy
+#   2  TOOL ERROR no verdict was rendered — the plan has NOT been judged
+#
+# `allow_failure: false` is the default and is deliberate: 1 and 2 must both stop the pipeline.
+# Setting allow_failure to true to "unblock the team" turns the gate into decoration.
+
+.impac_tfgate:
+  stage: test
+  # python3 and curl are REQUIRED. The client is bash + python3 stdlib only (no jq — it is not on
+  # every runner image), and it dies with TOOL ERROR rather than a pass if either is missing.
+  # Override `image` if your runners use something without them, but do not remove them.
+  image: python:3.12-slim
+  variables:
+    # Where the terraform plan JSON is. Produce it in an earlier job with:
+    #   terraform show -json tfplan > plan.json
+    # and pass it here as an artifact.
+    IMPAC_PLAN_JSON: 'plan.json'
+    # Root of the terraform source, for resolving findings to file:line. Findings carry a resource
+    # address but no source location — the server evaluates plan JSON and never sees your .tf
+    # files — so the runner is the only participant that can establish one. Point this at the
+    # directory whose .tf files produced the plan.
+    IMPAC_SOURCE_DIR: '.'
+    IMPAC_BLOCK_ON: 'high'
+    IMPAC_FRAMEWORKS: ''
+    IMPAC_FRAMEWORK_BLOCK_ON: ''
+    IMPAC_TIMEOUT_MINUTES: '10'
+    IMPAC_POLL_INTERVAL_SECONDS: '10'
+    IMPAC_REPORT_PATH: 'report.json'
+    IMPAC_SARIF_PATH: 'report.sarif'
+    # Step outputs land here as a dotenv artifact, so later jobs can read GATE_VERDICT,
+    # GATE_EXIT_CODE, GATE_BLOCKED_COUNT and GATE_UID as ordinary variables.
+    IMPAC_DOTENV_PATH: 'gate.env'
+    # Where the client is fetched from, and at which ref. PIN A TAG — a branch means the bytes
+    # that gate your infrastructure can change under you. Repoint the base at an internal mirror
+    # for air-gapped runners; the digest check still applies, so a mirror cannot substitute
+    # different bytes without failing closed.
+    IMPAC_CLIENT_BASE: 'https://raw.githubusercontent.com/imPAClabs/tfgate-action'
+    IMPAC_CLIENT_REF: 'v1'
+  before_script:
+    - |
+      set -eu
+      if ! command -v curl >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates
+      fi
+      # GitLab's `include:` pulls this YAML and nothing else, so unlike the GitHub action — which
+      # gets the whole action repo checked out at github.action_path — the client scripts are not
+      # present and must be fetched.
+      #
+      # Fetched over https from a pinned ref and verified against a checked-in SHA-256 manifest.
+      # A gate that silently ran unverified bytes would be worse than no gate: whoever can
+      # substitute gate.sh decides every verdict. A digest mismatch is a TOOL ERROR (exit 2),
+      # never a pass.
+      mkdir -p "${CI_PROJECT_DIR}/.impac-tfgate/scripts"
+      cd "${CI_PROJECT_DIR}/.impac-tfgate/scripts"
+      for f in gate.sh render.py SHA256SUMS.txt; do
+        curl -fsSL --retry 3 --retry-connrefused --max-time 60 \
+          -o "$f" "${IMPAC_CLIENT_BASE}/${IMPAC_CLIENT_REF}/scripts/${f}" \
+          || { echo "imPAC tfgate [error]: TOOL ERROR — could not fetch ${f} from ${IMPAC_CLIENT_BASE}/${IMPAC_CLIENT_REF}"; exit 2; }
+      done
+      # sha256sum is in coreutils on the python images; shasum is the BSD fallback.
+      if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c SHA256SUMS.txt \
+          || { echo "imPAC tfgate [error]: TOOL ERROR — client digest mismatch; refusing to run unverified bytes"; exit 2; }
+      elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -c SHA256SUMS.txt \
+          || { echo "imPAC tfgate [error]: TOOL ERROR — client digest mismatch; refusing to run unverified bytes"; exit 2; }
+      else
+        echo "imPAC tfgate [error]: TOOL ERROR — no sha256 tool available to verify the client"
+        exit 2
+      fi
+      cd "${CI_PROJECT_DIR}"
+  script:
+    - |
+      # Inputs reach the script through the environment, never through a command line: a token in
+      # argv lands in process listings and in any log that echoes the command.
+      #
+      # ci-provider is left to autodetect — GitLab sets GITLAB_CI on every runner, so the script
+      # picks up the GitLab provenance mapping and the dotenv/plain-text emitters on its own.
+      INPUT_API_URL="$IMPAC_API_URL" \
+      INPUT_PIPELINE_KEY="$IMPAC_PIPELINE_KEY" \
+      INPUT_PLAN_JSON="$IMPAC_PLAN_JSON" \
+      INPUT_SOURCE_DIR="$IMPAC_SOURCE_DIR" \
+      INPUT_BLOCK_ON="$IMPAC_BLOCK_ON" \
+      INPUT_FRAMEWORKS="$IMPAC_FRAMEWORKS" \
+      INPUT_FRAMEWORK_BLOCK_ON="$IMPAC_FRAMEWORK_BLOCK_ON" \
+      INPUT_TIMEOUT_MINUTES="$IMPAC_TIMEOUT_MINUTES" \
+      INPUT_POLL_INTERVAL_SECONDS="$IMPAC_POLL_INTERVAL_SECONDS" \
+      INPUT_REPORT_PATH="$IMPAC_REPORT_PATH" \
+      INPUT_SARIF_PATH="$IMPAC_SARIF_PATH" \
+      INPUT_DOTENV_PATH="$IMPAC_DOTENV_PATH" \
+      GATE_SCRIPT_DIR="${CI_PROJECT_DIR}/.impac-tfgate/scripts" \
+      bash "${CI_PROJECT_DIR}/.impac-tfgate/scripts/gate.sh"
+  artifacts:
+    # `when: always` is load-bearing. The report and SARIF must be kept when the gate BLOCKS —
+    # that is precisely when a reviewer needs them. Keeping them only on success would surface
+    # artifacts exclusively for runs that had nothing to show.
+    when: always
+    paths:
+      - '$IMPAC_REPORT_PATH'
+      - '$IMPAC_SARIF_PATH'
+    reports:
+      dotenv: '$IMPAC_DOTENV_PATH'
