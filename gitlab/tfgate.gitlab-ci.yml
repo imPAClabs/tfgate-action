@@ -10,6 +10,7 @@
 #
 #   variables:
 #     IMPAC_API_URL: 'https://api.yourstack.impac.io'
+#     # IMPAC_TOKEN_URL: V2 only, and only if Keycloak is not at <api-url>/realms/impac/... .
 #     # IMPAC_PIPELINE_KEY: set as a MASKED, PROTECTED CI/CD variable in the project settings.
 #     #                     Never in this file — it can submit plans against your deployment.
 #
@@ -63,6 +64,7 @@
     IMPAC_TIMEOUT_MINUTES: '10'
     IMPAC_POLL_INTERVAL_SECONDS: '10'
     IMPAC_REPORT_PATH: 'report.json'
+    IMPAC_TOKEN_URL: ''
     IMPAC_SARIF_PATH: 'report.sarif'
     # Step outputs land here as a dotenv artifact, so later jobs can read GATE_VERDICT,
     # GATE_EXIT_CODE, GATE_BLOCKED_COUNT and GATE_UID as ordinary variables.
@@ -115,6 +117,7 @@
       # picks up the GitLab provenance mapping and the dotenv/plain-text emitters on its own.
       INPUT_API_URL="$IMPAC_API_URL" \
       INPUT_PIPELINE_KEY="$IMPAC_PIPELINE_KEY" \
+      INPUT_TOKEN_URL="$IMPAC_TOKEN_URL" \
       INPUT_PLAN_JSON="$IMPAC_PLAN_JSON" \
       INPUT_SOURCE_DIR="$IMPAC_SOURCE_DIR" \
       INPUT_BLOCK_ON="$IMPAC_BLOCK_ON" \

@@ -28,14 +28,23 @@ branding:
 inputs:
   api-url:
     description: >-
-      Base URL of your imPAC deployment, e.g. https://api.yourstack.impac.io. The action appends
-      the /it/v3/gate/* paths itself.
+      Base URL of your imPAC deployment, e.g. https://api.yourstack.impac.io (V1) or
+      https://yourstack.example.com (V2). The action appends the /it/v3/gate/* (V1) or
+      /api/v4/gate/* (V2) paths itself.
     required: true
   pipeline-key:
     description: >-
       imPAC pipeline key, scoped CI_SCANNER. Pass a secret, never a literal — this key can submit
-      plans for evaluation on your deployment.
+      plans for evaluation on your deployment. A V2 key is "<client_id>:<secret>" as the Pipeline
+      Keys tab prints it; the action exchanges it for an access token automatically.
     required: true
+  token-url:
+    description: >-
+      V2 only. OAuth2 token endpoint the pipeline key is exchanged at. Defaults to
+      <api-url>/realms/impac/protocol/openid-connect/token; set it only if your deployment serves
+      Keycloak elsewhere (the Pipeline Keys tab shows the exact URL). Must be https.
+    required: false
+    default: ''
   plan-json:
     description: 'Path to `terraform show -json` output.'
     required: true
@@ -126,6 +135,7 @@ runs:
         INPUT_CI_PROVIDER: ${{ inputs.ci-provider }}
         INPUT_API_URL: ${{ inputs.api-url }}
         INPUT_PIPELINE_KEY: ${{ inputs.pipeline-key }}
+        INPUT_TOKEN_URL: ${{ inputs.token-url }}
         INPUT_PLAN_JSON: ${{ inputs.plan-json }}
         INPUT_SOURCE_DIR: ${{ inputs.source-dir }}
         INPUT_BLOCK_ON: ${{ inputs.block-on }}
