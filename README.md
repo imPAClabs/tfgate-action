@@ -23,6 +23,15 @@ only the wrapper differs.
   CI/CD variable on GitLab. Never a literal in a pipeline file.
 - A runner with `curl` and `python3`. The client is bash plus the Python 3 standard library only.
 
+**V1 and V2 deployments.** The action works with both. A V2 (Keycloak-based) deployment's pipeline
+key looks like `<client_id>:<secret>`; the action spots the colon, exchanges the key for a
+short-lived access token at `<api-url>/realms/impac/protocol/openid-connect/token` (override with
+`token-url` / `IMPAC_TOKEN_URL`), refreshes it if a long poll outlives it, and calls
+`/api/v4/gate/*` with a Bearer token. A V1 key has no colon and keeps using `/it/v3/gate/*`
+unchanged. On V2 the admin's default *block-on* is a floor: the server applies the stricter of it
+and the pipeline's `block-on`, so a pipeline can tighten the gate but never loosen it. If your
+deployment restricts inbound traffic by IP (WAF allowlist), your runners' egress IPs must be on it.
+
 ---
 
 ## GitHub Actions
@@ -67,7 +76,8 @@ annotations still carry the whole verdict.
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `api-url` | yes | — | Base URL of your imPAC deployment. The action appends the `/it/v3/gate/*` paths itself. |
-| `pipeline-key` | yes | — | `CI_SCANNER`-scoped imPAC pipeline key. Pass from a secret. |
+| `pipeline-key` | yes | — | `CI_SCANNER`-scoped imPAC pipeline key. Pass from a secret. V2 keys are `<client_id>:<secret>`. |
+| `token-url` | no | `<api-url>/realms/impac/protocol/openid-connect/token` | V2 only. Token endpoint for the pipeline key; must be https. |
 | `plan-json` | yes | — | Path to `terraform show -json` output. |
 | `source-dir` | no | `.` | Terraform source root, scanned to resolve `file:line` for annotations. Point it at the directory whose `.tf` files produced the plan. |
 | `block-on` | no | `high` | Block on findings at or above this severity: `critical`, `high`, `medium`, `low`. |
@@ -133,6 +143,7 @@ Set these under `variables:` on your `terraform-gate` job, or globally.
 |---|---|---|
 | `IMPAC_API_URL` | — | **Required.** Base URL of your imPAC deployment. |
 | `IMPAC_PIPELINE_KEY` | — | **Required.** Set as a masked, protected CI/CD variable — never in the YAML. |
+| `IMPAC_TOKEN_URL` | — | V2 only. Token endpoint override; blank uses `<api-url>/realms/impac/protocol/openid-connect/token`. |
 | `IMPAC_PLAN_JSON` | `plan.json` | Path to the plan JSON, passed in as an artifact from the plan job. |
 | `IMPAC_SOURCE_DIR` | `.` | Terraform source root, for resolving findings to `file:line`. |
 | `IMPAC_BLOCK_ON` | `high` | Severity floor that blocks: `critical`, `high`, `medium`, `low`. |

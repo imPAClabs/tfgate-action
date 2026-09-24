@@ -27,6 +27,10 @@ set -uo pipefail
 # ---------------------------------------------------------------------------------------------
 API_URL="${INPUT_API_URL:-}"
 PIPELINE_KEY="${INPUT_PIPELINE_KEY:-}"
+# V2 only (see AUTH MODE below): OAuth2 token endpoint the pipeline key is exchanged at. Blank
+# means <api-url>/realms/impac/protocol/openid-connect/token, which is where every imPAC V2 stack
+# routes Keycloak on its public hostname.
+TOKEN_URL="${INPUT_TOKEN_URL:-}"
 PLAN_JSON="${INPUT_PLAN_JSON:-}"
 # Where to look for the .tf source when resolving file:line. Findings carry a resource address but
 # no source location — the server evaluates plan JSON and never sees the .tf files — so the runner
@@ -40,7 +44,17 @@ POLL_INTERVAL_SECONDS="${INPUT_POLL_INTERVAL_SECONDS:-10}"
 REPORT_PATH="${INPUT_REPORT_PATH:-report.json}"
 SARIF_PATH="${INPUT_SARIF_PATH:-report.sarif}"
 
-# AUTH HEADER SHAPE.
+# AUTH MODE.
+#
+# The key's shape picks the platform, so the same action works against both:
+#   - V1 (SaaS, rest/v3): the key is a single opaque token, sent as the Authorization header to
+#     /it/v3/gate/*.
+#   - V2 (self-hosted and SaaS-v4, /api/v4): the key is "<client_id>:<secret>" as the Admin
+#     Console's Pipeline Keys tab prints it. It is exchanged for a short-lived access token at the
+#     Keycloak token endpoint (client_credentials), and that token goes out as
+#     "Authorization: Bearer <token>" to /api/v4/gate/*. V1 keys never contain a colon.
+#
+# V1 AUTH HEADER SHAPE (the overrides below apply to V1 only; V2 always sends a Bearer token).
 #
 # The gate API matches the Authorization header value verbatim against the pipeline key, so the
 # header must carry the BARE token:
@@ -299,8 +313,13 @@ http() {
     local method="$1" url="$2" data_file="${3:-}"
     local args=(-sS -X "$method" -o "$BODY_FILE" -w '%{http_code}'
                 --connect-timeout 15 --max-time 120
-                -H "${AUTH_HEADER_NAME}: ${AUTH_HEADER_PREFIX}${PIPELINE_KEY}"
                 -H 'Accept: application/json')
+    if [ "$AUTH_MODE" = v2 ]; then
+        # Read from a file (curl -H @file) so the access token never appears in argv.
+        args+=(-H "@${AUTH_HEADER_FILE}")
+    else
+        args+=(-H "${AUTH_HEADER_NAME}: ${AUTH_HEADER_PREFIX}${PIPELINE_KEY}")
+    fi
     if [ -n "$data_file" ]; then
         args+=(-H 'Content-Type: application/json' --data-binary "@${data_file}")
     fi
@@ -362,6 +381,8 @@ check_status() {
             return 0 ;;
         401|403)
             die "$what was rejected with HTTP $code — the pipeline key is missing, revoked, expired, or not scoped CI_SCANNER. $(server_error)" ;;
+        413)
+            die "$what was refused with HTTP 413 — the plan is larger than the server accepts. $(server_error)" ;;
         000|"")
             die "$what could not reach ${API_URL} (connection failed, DNS, or TLS). $(server_error)" ;;
         *)
@@ -397,12 +418,78 @@ case "$POLL_INTERVAL_SECONDS" in ''|*[!0-9.]*) die "poll-interval-seconds must b
 
 # Strip a trailing slash so the URLs below concatenate cleanly whichever way api-url was written.
 API_URL="${API_URL%/}"
-GATE_BASE="${API_URL}/it/v3/gate/evaluations"
+case "$PIPELINE_KEY" in
+    *:*) AUTH_MODE=v2; GATE_PATH="/api/v4/gate/evaluations" ;;
+    *)   AUTH_MODE=v1; GATE_PATH="/it/v3/gate/evaluations" ;;
+esac
+GATE_BASE="${API_URL}${GATE_PATH}"
+
+if [ "$AUTH_MODE" = v2 ]; then
+    [ -n "${PIPELINE_KEY%%:*}" ] && [ -n "${PIPELINE_KEY#*:}" ] \
+        || die "pipeline-key looks like a V2 key but is not '<client_id>:<secret>'"
+    TOKEN_URL="${TOKEN_URL:-${API_URL}/realms/impac/protocol/openid-connect/token}"
+    # The pipeline secret is posted to this URL, so it must be TLS — except to a local stack.
+    case "$TOKEN_URL" in
+        https://*) ;;
+        http://localhost[:/]*|http://127.0.0.1[:/]*|http://\[::1\][:/]*) ;;
+        *) die "token-url must be https:// (plain http is only allowed to localhost), got '$TOKEN_URL'" ;;
+    esac
+fi
 
 WORK_DIR=$(mktemp -d) || { annotate error "TOOL ERROR — could not create a temporary directory"; exit 2; }
 # Also removes the request bodies, which is where the presigned URL lives.
 trap 'rm -rf "$WORK_DIR"' EXIT
 BODY_FILE="${WORK_DIR}/body.json"
+AUTH_HEADER_FILE="${WORK_DIR}/auth.header"
+TOKEN_EXPIRES_AT=0
+
+# V2: exchange the pipeline key for an access token, and again whenever the current one is close
+# to expiry — a poll can outlive a short realm token lifespan. Called in THIS shell before each
+# API call (never from inside http(), which runs in a $(...) subshell where a refreshed token
+# would be lost). The id and secret go to curl through files, never argv.
+ensure_token() {
+    [ "$AUTH_MODE" = v2 ] || return 0
+    local now; now=$(date +%s)
+    [ "$now" -lt "$TOKEN_EXPIRES_AT" ] && return 0
+
+    local id_file="${WORK_DIR}/client_id" secret_file="${WORK_DIR}/client_secret"
+    local token_body="${WORK_DIR}/token.json" code
+    ( umask 077
+      printf '%s' "${PIPELINE_KEY%%:*}" > "$id_file"
+      printf '%s' "${PIPELINE_KEY#*:}" > "$secret_file" ) \
+        || die "could not stage the pipeline key for the token request"
+    code=$(curl -sS -X POST -o "$token_body" -w '%{http_code}' \
+        --connect-timeout 15 --max-time 60 \
+        -H 'Accept: application/json' \
+        --data-urlencode 'grant_type=client_credentials' \
+        --data-urlencode "client_id@${id_file}" \
+        --data-urlencode "client_secret@${secret_file}" \
+        "$TOKEN_URL" 2>/dev/null || true)
+    rm -f "$id_file" "$secret_file"
+    case "$code" in
+        200) ;;
+        000|"") rm -f "$token_body"; die "could not reach the token endpoint ${TOKEN_URL} (connection failed, DNS, or TLS)" ;;
+        400|401) rm -f "$token_body"; die "the token endpoint rejected the pipeline key (HTTP $code) — it is wrong or has been revoked" ;;
+        *) rm -f "$token_body"; die "the token endpoint ${TOKEN_URL} returned HTTP $code" ;;
+    esac
+
+    local lifetime
+    lifetime=$( umask 077; TOKEN_BODY="$token_body" HEADER_OUT="$AUTH_HEADER_FILE" python3 -c '
+import json, os, sys
+doc = json.load(open(os.environ["TOKEN_BODY"]))
+tok = doc.get("access_token") or ""
+if not tok:
+    sys.exit(1)
+with open(os.environ["HEADER_OUT"], "w") as fh:
+    fh.write("Authorization: Bearer " + tok + "\n")
+sys.stdout.write(str(int(doc.get("expires_in") or 300)))
+' ) || { rm -f "$token_body"; die "the token endpoint returned no access_token"; }
+    rm -f "$token_body"
+    # Refresh a minute early (never sooner than 30s from now) so a request can't race expiry.
+    local margin=60
+    [ "$lifetime" -gt 90 ] || margin=$(( lifetime / 2 ))
+    TOKEN_EXPIRES_AT=$(( now + lifetime - margin ))
+}
 
 PLAN_SIZE=$(python3 -c 'import os,sys; sys.stdout.write(str(os.path.getsize(sys.argv[1])))' "$PLAN_JSON") \
     || die "could not size the plan file '$PLAN_JSON'"
@@ -509,8 +596,9 @@ with open(os.environ["GATE_OUT"], "w") as fh:
     json.dump(body, fh)
 ' || die "could not build the create request body"
 
+ensure_token
 CODE=$(http POST "$GATE_BASE" "$CREATE_REQ")
-check_status "$CODE" "create (POST /it/v3/gate/evaluations)"
+check_status "$CODE" "create (POST ${GATE_PATH})"
 
 EVAL_UID=$(json_get "$BODY_FILE" "uid") || die "create returned a body that is not JSON. $(server_error)"
 UPLOAD_URL=$(json_get "$BODY_FILE" "upload_url")
@@ -545,8 +633,9 @@ log "imPAC tfgate: plan uploaded"
 # 3. START
 # ---------------------------------------------------------------------------------------------
 
+ensure_token
 CODE=$(http POST "${GATE_BASE}/${EVAL_UID}/start")
-check_status "$CODE" "start (POST /it/v3/gate/evaluations/${EVAL_UID}/start)"
+check_status "$CODE" "start (POST ${GATE_PATH}/${EVAL_UID}/start)"
 
 log "imPAC tfgate: evaluation dispatched, waiting for the verdict"
 
@@ -568,8 +657,9 @@ while :; do
         die "timed out after ${TIMEOUT_MINUTES} minute(s) waiting for evaluation ${EVAL_UID} (last status: ${STATUS:-unknown}). No verdict was rendered."
     fi
 
+    ensure_token
     CODE=$(http GET "${GATE_BASE}/${EVAL_UID}")
-    check_status "$CODE" "poll (GET /it/v3/gate/evaluations/${EVAL_UID})"
+    check_status "$CODE" "poll (GET ${GATE_PATH}/${EVAL_UID})"
     cp "$BODY_FILE" "$STATUS_FILE" || die "could not stage the poll response"
 
     STATUS=$(json_get "$STATUS_FILE" "status") \
